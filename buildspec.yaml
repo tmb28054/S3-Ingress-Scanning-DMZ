@@ -1,0 +1,16 @@
+---
+version: 0.2
+phases:
+  # install:
+  #   runtime-versions:
+  #     python: 3.12
+  #   commands:
+  #     - python -m pip install -U pip
+  build:
+    commands:
+      - bash -e scripts/build.sh
+artifacts:
+  files:
+    - templates/cloudformation.yaml
+    - '*.json'
+  name: s3-scan.zip

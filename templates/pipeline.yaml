@@ -1,0 +1,443 @@
+---
+# it is better to be readable then limited to 80 chars
+# yamllint disable rule:line-length
+AWSTemplateFormatVersion: 2010-09-09
+Description:
+  I provide a s3 bucket for scanning ingress objects. Moving to a DMZ if the
+  object is safe.
+Metadata:
+  cfn-lint:
+    config:
+      regions:
+        - us-east-1
+        - us-east-2
+  AWS::CloudFormation::Interface:
+    ParameterLabels:
+      - ArtifactBucket:
+          default: |
+            The bucket with the code artifact aka the bucket with the zip file.
+      - ArtifactKey:
+          default: The full key path with the zip file in the bucket.
+      - TopicName:
+          default: |
+            (optional) The name of the topic to create. If left bank a random
+            topic will be created.
+      - IngressBucketName:
+          default: |
+            (optional) The name of the bucket where data is uploaded to be
+            scanned. If left bank a random bucket will be created.
+      - DmzBucketName:
+          default: |
+            (optional) The name of the bucket where data is uploaded after
+            scanned and found to be safe. If left bank a bucket topic will be
+            created.
+      - QuarantineBucketName:
+          default: |
+            (optional) The name of the bucket where data is uploaded after
+            scanned and found to be NOT safe. If left bank a random bucket will
+            be created.
+      - VpcId:
+          default: |
+            The VpcId to deploy the codebuild and scanning lambda too. If either
+            the VpcId or Subnets are blank no network will be used.
+      - Subnets:
+          default: |
+            A comma delimited list of subnet which codebuild and scanning lambda
+            should use. If either the VpcId or Subnets are blank no network will
+            be used.
+      - AVUpdateSchedule:
+          default: |
+            A cron schedule for how often ClamAV should update the definitions.
+            Note ClamAV limits to once an our.
+      - IngressPrincipals:
+          default: |
+            A comma delimited list of AWS Principles who will have access to the
+            Ingress bucket. If left blank local iam will be trusted.
+      - QuarantineAdmins:
+          default: |
+            A comma delimited list of AWS Principles who will have access to the
+            Quarantine bucket. If left blank local iam will be trusted.
+      - KmsKeyArn:
+          default: |
+            The KMS Key Arn of the KMS key to use. If left blank no key will be
+            used.
+      - AppStack:
+          default: |
+            The name of the stack where the scanning buckets and lambda will
+            reside.
+      - Architecture:
+          default: What Architecture to use. Generally arm is recommended.
+
+    ParameterGroups:
+      - Label:
+          default: Source Artifact
+        Parameters:
+          - ArtifactBucket
+          - ArtifactKey
+      - Label:
+          default: Resource Names (Optional)
+        Parameters:
+          - TopicName
+          - IngressBucketName
+          - DmzBucketName
+          - QuarantineBucketName
+      - Label:
+          default: Network Settings (Optional)
+        Parameters:
+          - VpcId
+          - Subnets
+      - Label:
+          default: Security Settings (Optional)
+        Parameters:
+          - AVUpdateSchedule
+          - QuarantineAdmins
+          - IngressPrincipals
+          - KmsKeyArn
+      - Label:
+          default: Miscellaneous
+        Parameters:
+          - AppStack
+          - Architecture
+
+Parameters:
+  IngressPrincipals:
+    Type: CommaDelimitedList
+    Description: |
+      A comma-delimited list of AWS Principals Arns who can write to the ingress
+      bucket.
+    Default: ''
+  AppStack:
+    Type: String
+    Description: Name for the AppStack
+    Default: s3-scan-stack
+  TopicName:
+    Type: String
+    Description: Name for the sns topic
+    Default: ''
+  ArtifactBucket:
+    Type: String
+    Description: The artifact bucket to use for CodePipeline
+  ArtifactKey:
+    Type: String
+    Description: The artifact key to use for CodePipeline
+  IngressBucketName:
+    Type: String
+    Description: Name for the ingress bucket
+    Default: ''
+  DmzBucketName:
+    Type: String
+    Description: Name for the dmz bucket
+    Default: ''
+  QuarantineBucketName:
+    Type: String
+    Description: Name for the quarantine bucket
+    Default: ''
+  VpcId:
+    Type: String
+    Description: The VPC to use for the lambda
+    Default: ''
+  Subnets:
+    Type: CommaDelimitedList
+    Description: A comma-delimited list of subnets to use
+    Default: ''
+  QuarantineAdmins:
+    Type: CommaDelimitedList
+    Description: A comma-delimited list Aws Arns for admins
+    Default: ''
+  AVUpdateSchedule:
+    Type: String
+    Description: Cron schedule for updating AV
+    Default: cron(0 9 * * ? *)
+  Architecture:
+    Type: String
+    Description: Cron schedule for updating AV
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+  KmsKeyArn:
+    Type: String
+    Description: The kms key arn to use for data encryption at rest
+    Default: ''
+
+Conditions:
+  NoSubnets: !Equals [!Join [',', !Ref Subnets], '']
+  NoVpc: !Equals [!Ref VpcId, '']
+  NoNetwork: !Or
+    - !Condition NoSubnets
+    - !Condition NoVpc
+  YesNetwork: !Not
+    - !Condition NoNetwork
+  Is-Arm: !Equals [!Ref Architecture, arm64]
+  No-Kms: !Equals [!Ref KmsKeyArn, '']
+
+Resources:
+  ImageRepo:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::ECR::Repository
+    # checkov:skip=CKV_AWS_51:The idea is to build and deploy a new container
+    # checkov:skip=CKV_AWS_136:I dont want to pay for kms
+    Properties:
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        RegistryId: !Ref AWS::AccountId
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "description": "Expire Untagged Images",
+                "action": { "type": "expire" },
+                "rulePriority": 1,
+                "selection": {
+                  "countType"     : "sinceImagePushed",
+                  "countUnit"     : "days",
+                  "countNumber"   : 7,
+                  "tagStatus"     : "untagged"
+                }
+              }
+            ]
+          }
+
+  CWPolicy:
+    DependsOn:
+      - Pipeline
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: !Sub /${AWS::StackName}/
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: codepipeline:StartPipelineExecution
+            Resource:
+              - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+
+  CWRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub /${AWS::StackName}/
+      ManagedPolicyArns:
+        - !Ref CWPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  # Run the build nightly
+  DailyBuild:
+    DependsOn:
+      - Pipeline
+    Type: AWS::Events::Rule
+    Properties:
+      Description: I trigger the build daily.
+      ScheduleExpression: !Ref AVUpdateSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+          RoleArn: !GetAtt CWRole.Arn
+          Id: RunPipelineDaily
+
+  SecurityGroup:
+    Condition: YesNetwork
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Security group for ${AWS::StackName}
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow API Calls
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      EncryptionKey: !If [No-Kms, !Ref 'AWS::NoValue', !Ref KmsKeyArn]
+      VpcConfig:
+        SecurityGroupIds: !If
+          - YesNetwork
+          - [!Ref SecurityGroup]
+          - !Ref AWS::NoValue
+        Subnets: !If
+          - YesNetwork
+          - !Ref Subnets
+          - !Ref AWS::NoValue
+        VpcId: !If
+          - YesNetwork
+          - !Ref VpcId
+          - !Ref AWS::NoValue
+      Name: !Ref AWS::StackName
+      QueuedTimeoutInMinutes: 300
+      Artifacts:
+        ArtifactIdentifier: !Ref AWS::StackName
+        EncryptionDisabled: false
+        Location: !Ref ArtifactBucket
+        Name: !Ref AWS::StackName
+        NamespaceType: NONE
+        OverrideArtifactName: true
+        Packaging: ZIP
+        Path: !Sub /${AWS::StackName}
+        Type: CODEPIPELINE
+      Cache:
+        Type: NO_CACHE
+      Description: !Sub Pipeline for ${AWS::StackName}
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        Image: !If
+          - Is-Arm
+          - aws/codebuild/amazonlinux2-aarch64-standard:3.0
+          - aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: !If [Is-Arm, ARM_CONTAINER, LINUX_CONTAINER]
+        EnvironmentVariables:
+          # The bucket we store our artifacts in
+          - Name: BUCKET
+            Value: !Ref ArtifactBucket
+            Type: PLAINTEXT
+          - Name: DOCKER_REPO
+            Value: !GetAtt ImageRepo.RepositoryUri
+            Type: PLAINTEXT
+          - Name: CodeBuildLogin
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            Type: PLAINTEXT
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${AWS::AccountId}/${AWS::Region}/${AWS::StackName}
+        S3Logs:
+          Status: ENABLED
+          Location: !Sub ${ArtifactBucket}/BuildLogs/${AWS::StackName}
+      ServiceRole: !GetAtt DeployRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        Location: !Sub ${ArtifactBucket}/Artifacts/${AWS::StackName}
+      Tags:
+        - Key: __StackName
+          Value: !Ref AWS::StackName
+      TimeoutInMinutes: 30
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: !Sub /aws/codebuild/${AWS::AccountId}/${AWS::Region}/${CodeBuild}
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Tags:
+        - Key: __StackName
+          Value: !Ref AWS::StackName
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-pipeline
+      ArtifactStore:
+        Location: !Ref ArtifactBucket
+        Type: S3
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt DeployRole.Arn
+      Tags:
+        - Key: __StackName
+          Value: !Ref AWS::StackName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: !Ref ArtifactKey
+                PollForSourceChanges: false
+        - Name: Build
+          Actions:
+            - Name: Build
+              RunOrder: 1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuild
+        - Name: DeployProd
+          Actions:
+            - Name: DeployTemplate
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+                # - Name: SourceArtifact
+              Configuration:
+                StackName: !Ref AppStack
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt DeployRole.Arn
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: BuildArtifact::templates/cloudformation.yaml
+                # TemplatePath: SourceArtifact::templates/cloudformation.yaml
+                # TemplateConfiguration: BuildArtifact::parameters.json
+                ParameterOverrides: !Sub
+                  - |
+                    {
+                      "RepositoryUri": "${ImageRepo.RepositoryUri}",
+                      "TopicName": "${TopicName}",
+                      "IngressBucketName": "${IngressBucketName}",
+                      "DmzBucketName": "${DmzBucketName}",
+                      "QuarantineBucketName": "${QuarantineBucketName}",
+                      "VpcId": "${VpcId}",
+                      "Subnets": "${subnets}",
+                      "Architecture": "${Architecture}",
+                      "QuarantineAdmins": "${quarantineadmins}",
+                      "KmsKeyArn": "${KmsKeyArn}",
+                      "IngressPrincipals": "${ingressprincipals}",
+                      "ImageTag": {
+                        "Fn::GetParam": [
+                          "BuildArtifact",
+                          "parameters.json",
+                          "ImageTag"
+                        ]
+                      }
+                    }
+                  - subnets: !Join [',', !Ref Subnets]
+                    ingressprincipals: !Join [',', !Ref IngressPrincipals]
+                    quarantineadmins: !Join [',', !Ref QuarantineAdmins]
+
+Outputs:
+  RepoUrl:
+    Value: !GetAtt ImageRepo.RepositoryUri

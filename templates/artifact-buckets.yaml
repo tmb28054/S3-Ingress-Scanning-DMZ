@@ -1,0 +1,138 @@
+---
+# it is better to be readable then limited to 80 chars
+# yamllint disable rule:line-length
+AWSTemplateFormatVersion: 2010-09-09
+Description: artifact bucket
+Metadata:
+  cfn-lint:
+    config:
+      regions:
+        us-east-1
+        us-east-2
+Parameters:
+  BucketName:
+    Type: String
+    Default: ''
+    Description: |
+      (optional) The name for the bucket, if not provided one will be generated
+  Replicate:
+    AllowedValues: ['Yes', 'No']
+    Type: String
+    Description: Setup Replication
+Conditions:
+  IfE1: !Equals [!Ref 'AWS::Region', us-east-1]
+  Replication: !Equals [!Ref Replicate, 'Yes']
+  NoBucketName: !Equals [!Ref BucketName, '']
+Resources:
+  BucketBackupRole:
+    Condition: Replication
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Ref BucketBackupPolicy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+
+  BucketBackupPolicy:
+    Condition: Replication
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Replication Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:GetReplicationConfiguration
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${AWS::AccountId}-us-east-1
+              - !Sub arn:aws:s3:::${AWS::AccountId}-us-east-2
+          - Action:
+              - s3:GetObjectVersion
+              - s3:GetObjectVersionAcl
+              - s3:ReplicateObject
+              - s3:ReplicateDelete
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:s3:::${AWS::AccountId}-us-east-1/*
+              - !Sub arn:aws:s3:::${AWS::AccountId}-us-east-2/*
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:I do not want to pay for logs
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3045  # We are using a bucket policy
+    Properties:
+      BucketName: !If
+        - NoBucketName
+        - !Sub ${AWS::StackName}-${AWS::Region}
+        - !Ref BucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: BuildLogs
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: BuildLogs
+          - Id: s3-scan-pipeline-pip
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: s3-scan-pipeline-pip
+          - Id: AbortIncompleteMultipartUpload
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Status: Enabled
+          - Id: NoncurrentVersion
+            NoncurrentVersionExpirationInDays: 1
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      VersioningConfiguration:
+        Status: Enabled
+      ReplicationConfiguration: !If
+        - Replication
+        - Role: !GetAtt BucketBackupRole.Arn
+          Rules:
+            - Destination:
+                Bucket: !Sub
+                  - arn:aws:s3:::${AWS::StackName}-${region}
+                  - region: !If [IfE1, us-east-2, us-east-1]
+                StorageClass: STANDARD
+              Id: Backup
+              Prefix: ''
+              Status: Enabled
+        - !Ref AWS::NoValue
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # Deny access to bucket if the API call was not made using HTTPS
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub ${Bucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false

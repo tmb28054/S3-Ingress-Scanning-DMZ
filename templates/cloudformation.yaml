@@ -1,0 +1,580 @@
+---
+# it is better to be readable then limited to 80 chars
+# yamllint disable rule:line-length
+AWSTemplateFormatVersion: 2010-09-09
+Description:
+  I provide a s3 bucket for scanning ingress objects. Moving to a DMZ if the
+  object is safe.
+Metadata:
+  cfn-lint:
+    config:
+      regions:
+        - us-east-1
+        - us-east-2
+
+Parameters:
+  ImageTag:
+    Type: String
+    Description: The image tag to use for our scanning lambda
+    Default: v1
+  RepositoryUri:
+    Type: String
+    Description: The docker repo for our image
+    Default: 860517021689.dkr.ecr.us-east-1.amazonaws.com/s3-scan-pipeline-imagerepo-aaofviurcqvd
+  TopicName:
+    Type: String
+    Description: Name for the sns topic
+    Default: ''
+  IngressBucketName:
+    Type: String
+    Description: Name for the ingress bucket
+    Default: ''
+  DmzBucketName:
+    Type: String
+    Description: Name for the dmz bucket
+    Default: ''
+  QuarantineBucketName:
+    Type: String
+    Description: Name for the dmz bucket
+    Default: ''
+  VpcId:
+    Type: String
+    Description: The VPC to use for the lambda
+    Default: ''
+  Subnets:
+    Type: CommaDelimitedList
+    Description: A List of subnets to use
+    Default: ''
+  Architecture:
+    Type: String
+    Description: Cron schedule for updating AV
+    Default: arm64
+    AllowedValues: ['arm64', 'x86_64']
+  QuarantineAdmins:
+    Type: CommaDelimitedList
+    Description: A comma-delimited list AWS Principals Arns for admins
+    Default: ''
+  IngressPrincipals:
+    Type: CommaDelimitedList
+    Description: |
+      A comma-delimited list of AWS Principals Arns who can write to the ingress
+      bucket.
+    Default: ''
+  KmsKeyArn:
+    Type: String
+    Description: The kms key arn to use for data encryption at rest
+    Default: ''
+
+Conditions:
+  NamedTopic: !Not
+    - !Equals [!Ref TopicName, '']
+  NamedIngressBucket: !Not
+    - !Equals [!Ref IngressBucketName, '']
+  NamedDmzBucket: !Not
+    - !Equals [!Ref DmzBucketName, '']
+  NamedQuarantineBucket: !Not
+    - !Equals [!Ref QuarantineBucketName, '']
+  NoSubnets: !Equals [!Join [',', !Ref Subnets], '']
+  NoQuarantineAdmins: !Equals [!Join [',', !Ref QuarantineAdmins], '']
+  NoIngressPrincipals: !Equals [!Join [',', !Ref IngressPrincipals], '']
+  NoVpc: !Equals [!Ref VpcId, '']
+  NoNetwork: !Or
+    - !Condition NoSubnets
+    - !Condition NoVpc
+  YesNetwork: !Not
+    - !Condition NoNetwork
+  No-Kms: !Equals [!Ref KmsKeyArn, '']
+
+Resources:
+  SecurityGroup:
+    Condition: YesNetwork
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Security group for ${AWS::StackName}
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow API Calls
+
+  IngressBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Use cloudtrail data event logs
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3045  # We are using a bucket policy
+    Properties:
+      BucketEncryption: !If
+        - No-Kms
+        - !Ref AWS::NoValue
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref KmsKeyArn
+      BucketName: !If
+        - NamedIngressBucket
+        - !Ref IngressBucketName
+        - !Sub ingress-${AWS::StackName}
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ScanQueue.Arn
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: AbortIncompleteMultipartUpload
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Status: Enabled
+          - Id: NoncurrentVersion
+            NoncurrentVersionExpirationInDays: 1
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  IngressBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16  # S3 Bucket policy should not allow * principal
+            reason: false positive there is a clear condition
+    Properties:
+      Bucket: !Ref IngressBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # Deny access to bucket if the API call was not made using HTTPS
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt IngressBucket.Arn
+              - !Sub ${IngressBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:*Multi*
+              - s3:*Object*
+              - s3:Get*
+            Resource:
+              - !GetAtt IngressBucket.Arn
+              - !Sub ${IngressBucket.Arn}/*
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !GetAtt LambdaRole.Arn
+          - !If
+            - NoIngressPrincipals
+            - !Ref AWS::NoValue
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - s3:GetBucketLocation
+                - s3:PutObject*
+                - s3:List*
+              Resource:
+                - !GetAtt IngressBucket.Arn
+                - !Sub ${IngressBucket.Arn}/*
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Ref IngressPrincipals
+          - Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:GetObject*
+            Resource:
+              - !Sub ${IngressBucket.Arn}/*
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn: !GetAtt LambdaRole.Arn
+
+  DmzBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Use cloudtrail data event logs
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3045  # We are using a bucket policy
+    Properties:
+      BucketEncryption: !If
+        - No-Kms
+        - !Ref AWS::NoValue
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref KmsKeyArn
+      BucketName: !If
+        - NamedDmzBucket
+        - !Ref DmzBucketName
+        - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: AbortIncompleteMultipartUpload
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Status: Enabled
+          - Id: NoncurrentVersion
+            NoncurrentVersionExpirationInDays: 1
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DmzBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16  # S3 Bucket policy should not allow * principal
+            reason: false positive there is a clear condition
+    Properties:
+      Bucket: !Ref DmzBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # Deny access to bucket if the API call was not made using HTTPS
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DmzBucket.Arn
+              - !Sub ${DmzBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:*Multi*
+              - s3:*Object*
+              - s3:Get*
+            Resource:
+              - !GetAtt DmzBucket.Arn
+              - !Sub ${DmzBucket.Arn}/*
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !GetAtt LambdaRole.Arn
+
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Use cloudtrail data event logs
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3045  # We are using a bucket policy
+    Properties:
+      BucketEncryption: !If
+        - No-Kms
+        - !Ref AWS::NoValue
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref KmsKeyArn
+      BucketName: !If
+        - NamedQuarantineBucket
+        - !Ref QuarantineBucketName
+        - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: AbortIncompleteMultipartUpload
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Status: Enabled
+          - Id: NoncurrentVersion
+            NoncurrentVersionExpirationInDays: 1
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  QuarantineBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16  # S3 Bucket policy should not allow * principal
+            reason: false positive there is a clear condition
+    Properties:
+      Bucket: !Ref QuarantineBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # Deny access to bucket if the API call was not made using HTTPS
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub ${QuarantineBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:*Multi*
+              - s3:*Object*
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub ${QuarantineBucket.Arn}/*
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !GetAtt LambdaRole.Arn
+          - Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:*Multi*
+              - s3:PutObject*
+            Resource:
+              - !GetAtt QuarantineBucket.Arn
+              - !Sub ${QuarantineBucket.Arn}/*
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn:
+                  - !GetAtt LambdaRole.Arn
+          - !If
+            - NoQuarantineAdmins
+            - !Ref AWS::NoValue
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - s3:Get*
+              Resource:
+                - !GetAtt QuarantineBucket.Arn
+                - !Sub ${QuarantineBucket.Arn}/*
+              Condition:
+                ArnEquals:
+                  aws:PrincipalArn: !Ref QuarantineAdmins
+          - !If
+            - NoQuarantineAdmins
+            - !Ref AWS::NoValue
+            - Effect: Deny
+              Principal: '*'
+              Action:
+                - s3:GetObject*
+              Resource:
+                - !Sub ${QuarantineBucket.Arn}/*
+              Condition:
+                ArnNotEquals:
+                  aws:PrincipalArn: !Ref QuarantineAdmins
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !If
+        - NamedTopic
+        - !Ref TopicName
+        - !Ref AWS::NoValue
+      TopicName: !If
+        - NamedTopic
+        - !Ref TopicName
+        - !Ref AWS::NoValue
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: MyDeadLetterQueue
+
+  ScanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 3600
+      VisibilityTimeout: 901
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ScanQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F21  # SQS Queue policy should not allow * principal
+            reason: false positive there is a clear condition
+    Properties:
+      Queues:
+        - !Ref ScanQueue
+      PolicyDocument:
+        Id: SQSPolicy
+        Statement:
+          - Sid: SQSEventPolicy
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - sqs:SendMessage
+              - sqs:GetQueueUrl
+              - sqs:GetQueueAttributes
+            Resource: '*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub
+                  - arn:aws:s3:::${bucketname}
+                  - bucketname: !If
+                      - NamedIngressBucket
+                      - !Ref IngressBucketName
+                      - !Sub ingress-${AWS::StackName}
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub /${AWS::StackName}/
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref Topic
+
+  ScanLambda:
+    DependsOn: LambdaPolicy
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_115:Ideally this would run in its own account
+    Properties:
+      Architectures:
+        - !Ref Architecture
+      Code:
+        ImageUri: !Sub
+          - ${RepoUrl}:${RepoTag}
+          - RepoUrl: !Ref RepositoryUri
+            RepoTag: !Ref ImageTag
+      DeadLetterConfig:
+        TargetArn: !Ref Topic
+      Description: I scan objects with clamav
+      Environment:
+        Variables:
+          AWS_RETRY_MODE: adaptive
+          TOPIC: !Ref Topic
+          DMZ_BUCKET: !Ref DmzBucket
+          Q_BUCKET: !Ref QuarantineBucket
+      PackageType: Image
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 10240
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 900
+      VpcConfig:
+        SecurityGroupIds: !If
+          - YesNetwork
+          - [!Ref SecurityGroup]
+          - !Ref AWS::NoValue
+        SubnetIds: !If
+          - YesNetwork
+          - !Ref Subnets
+          - !Ref AWS::NoValue
+
+  ScanLambdaLogGroup:
+    # checkov:skip=CKV_AWS_158:no need to encrypt log data which has no data exposure
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ScanLambda}
+      RetentionInDays: 7
+
+  LambdaPolicy:
+    # checkov:skip=CKV_AWS_111:the access is limited to the stack
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: !Sub /${AWS::StackName}/
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sns:Publish
+              - logs:PutLogEvents
+            Resource:
+              - !GetAtt ScanQueue.Arn
+              - !Ref Topic
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}*:log-stream:*
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeSubnets
+              - ec2:DeleteNetworkInterface
+              - ec2:AssignPrivateIpAddresses
+              - ec2:UnassignPrivateIpAddresses
+              - sns:Publish
+            Resource: '*'
+
+  ScanQueueEvent:
+    DependsOn: LambdaPolicy
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ScanQueue.Arn
+      FunctionName: !Ref ScanLambda
+
+Outputs:
+  IngressBucket:
+    Description: The bucket where new objects are uploaded
+    Value: !Ref IngressBucket
+  DmzBucket:
+    Description: |
+      The Bucket where objects are put after a scan has found them to be safe
+    Value: !Ref DmzBucket
+  Quarantine:
+    Description: Where unsafe object are put
+    Value: !Ref QuarantineBucket
+  Topic:
+    Description: SNS topic to understand what is going on
+    Value: !Ref Topic
