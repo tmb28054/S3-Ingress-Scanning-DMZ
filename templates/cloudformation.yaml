@@ -16,11 +16,11 @@ Parameters:
   ImageTag:
     Type: String
     Description: The image tag to use for our scanning lambda
-    Default: v1
+    Default: 2024-01-19-11-39-21
   RepositoryUri:
     Type: String
     Description: The docker repo for our image
-    Default: 860517021689.dkr.ecr.us-east-1.amazonaws.com/s3-scan-pipeline-imagerepo-aaofviurcqvd
+    Default: 860517021689.dkr.ecr.us-east-1.amazonaws.com/s3-scan-pipeline-imagerepo-slc98xglevmp
   TopicName:
     Type: String
     Description: Name for the sns topic
@@ -100,6 +100,7 @@ Resources:
           Description: Allow API Calls
 
   IngressBucket:
+    DependsOn: ScanQueuePolicy
     Type: AWS::S3::Bucket
     # checkov:skip=CKV_AWS_18:Use cloudtrail data event logs
     Metadata:
@@ -416,7 +417,7 @@ Resources:
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: MyDeadLetterQueue
+      MessageRetentionPeriod: 1209600
 
   ScanQueue:
     Type: AWS::SQS::Queue
@@ -456,6 +457,19 @@ Resources:
                       - NamedIngressBucket
                       - !Ref IngressBucketName
                       - !Sub ingress-${AWS::StackName}
+          - Sid: LambdaAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: '*'
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn:
+                  - !GetAtt LambdaRole.Arn
 
   LambdaRole:
     Type: AWS::IAM::Role
@@ -478,11 +492,25 @@ Resources:
               - Effect: Allow
                 Action:
                   - sns:Publish
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - logs:PutLogEvents
                 Resource:
                   - !Ref Topic
+                  - !GetAtt ScanQueue.Arn
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}*:log-stream:*
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
 
   ScanLambda:
-    DependsOn: LambdaPolicy
     Type: AWS::Lambda::Function
     # checkov:skip=CKV_AWS_115:Ideally this would run in its own account
     Properties:
@@ -525,38 +553,9 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${ScanLambda}
       RetentionInDays: 7
 
-  LambdaPolicy:
-    # checkov:skip=CKV_AWS_111:the access is limited to the stack
-    Type: AWS::IAM::ManagedPolicy
-    Properties:
-      Path: !Sub /${AWS::StackName}/
-      PolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Action:
-              - sqs:ReceiveMessage
-              - sqs:DeleteMessage
-              - sqs:GetQueueAttributes
-              - sns:Publish
-              - logs:PutLogEvents
-            Resource:
-              - !GetAtt ScanQueue.Arn
-              - !Ref Topic
-              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}*:log-stream:*
-          - Effect: Allow
-            Action:
-              - ec2:CreateNetworkInterface
-              - ec2:DescribeNetworkInterfaces
-              - ec2:DescribeSubnets
-              - ec2:DeleteNetworkInterface
-              - ec2:AssignPrivateIpAddresses
-              - ec2:UnassignPrivateIpAddresses
-              - sns:Publish
-            Resource: '*'
-
   ScanQueueEvent:
-    DependsOn: LambdaPolicy
+    DependsOn:
+      - ScanQueuePolicy
     Type: AWS::Lambda::EventSourceMapping
     Properties:
       BatchSize: 1
